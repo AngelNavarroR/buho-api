@@ -1,0 +1,2 @@
+org.springframework.boot.autoconfigure.EnableAutoConfiguration=org.angbyte.config.BuhoAutoConfiguration
+org.springframework.context.ApplicationContextInitializer=org.angbyte.config.AutoConfigurationLoggerInit
