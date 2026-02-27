@@ -22,7 +22,6 @@ import org.springframework.beans.factory.config.BeanDefinition;
 import org.springframework.context.annotation.ClassPathScanningCandidateComponentProvider;
 import org.springframework.core.type.filter.AnnotationTypeFilter;
 import org.springframework.stereotype.Repository;
-import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.MultiValueMap;
 
@@ -32,11 +31,18 @@ import java.lang.reflect.Method;
 import java.math.BigDecimal;
 import java.text.SimpleDateFormat;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 @Repository
 public class BuhoPersistableImpl<T> implements BuhoPersistable {
+
+    private static final int DEFAULT_FETCH_SIZE = 500;
+    private static final int DEFAULT_QUERY_TIMEOUT_MS = 10000;
+    private static final int JDBC_BATCH_SIZE = 50;
+
+
     private static final String ENTITY_PREFIX = "entitys_";
     private static final String CLASS_TRANSLATION_PREFIX = "clazz_trans_";
     private final static Logger LOGGER = Logger.getLogger(BuhoPersistableImpl.class.getName());
@@ -45,6 +51,7 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
     @PersistenceContext
     private EntityManager entityManager;
     private Map<Long, Map<String, Object>> joinMappings;
+    private Map<Long, Map<String, EntityType>> entityTypes;
 
     public BuhoPersistableImpl(BuhoCache cache, BuhoProperties buhoProperties) {
         this.cache = cache;
@@ -56,8 +63,9 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
      */
     @PostConstruct
     public void init() {
-        refreshEntityModelCache();
+        refreshEntityModelCache(null);
         joinMappings = new LinkedHashMap<>();
+        entityTypes = new LinkedHashMap<>();
     }
 
     protected EntityManager getEntityManager() {
@@ -72,62 +80,106 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
     /**
      * Refreshes the cache with entity models from the EntityManager.
      * Creates a mapping of entity names to their corresponding EntityType.
+     *
+     * @return
      */
-    private void refreshEntityModelCache() {
+    private EntityType refreshEntityModelCache(String entityName) {
         try {
             if (entityManager == null) {
                 LOGGER.log(Level.WARNING, "EntityManager is not initialized");
-                return;
+                return null;
             }
-
+            AtomicReference<EntityType> entityTypeC = new AtomicReference<>();
+            StringBuffer sb = new StringBuffer();
+            AtomicReference<Integer> count = new AtomicReference<>(0);
             entityManager.getMetamodel().getEntities().forEach(entityType -> {
                 String cacheKey = ENTITY_PREFIX + entityType.getName();
+                if (entityType.getName().equalsIgnoreCase(entityName)) {
+                    entityTypeC.set(entityType);
+                }
                 if (!cache.containsKey(cacheKey)) {
                     cache.add(cacheKey, entityType);
-                    if (buhoProperties.isDebug())
-                        LOGGER.log(Level.INFO, "Caching entity model for {0}", entityType.getName());
+                    if (buhoProperties.isDebug()) sb.append(entityType.getName()).append(", ");
                 }
+                count.getAndSet(count.get() + 1);
             });
+
+            if (buhoProperties.isDebug()) LOGGER.log(Level.INFO, "Entity Models Cache: {0} entidades agregadas a la cache {1}", new Object[]{sb.toString(), count});
+
+            return entityTypeC.get();
         } catch (Exception e) {
             LOGGER.log(Level.SEVERE, "Error refreshing entity model cache", e);
         }
+        return null;
+    }
+
+    private void removeTranssaction(Long transactionId) {
+        joinMappings.remove(transactionId);
+        entityTypes.remove(transactionId);
     }
 
     private boolean isMultiColumnQuery(BusquedaModel searchCriteria) {
-        return searchCriteria.getFunctions() != null && searchCriteria.getFunctions().size() > 1;
+        return (searchCriteria.getFunctions() != null && searchCriteria.getFunctions().size() > 1)
+               || (searchCriteria.getColumns() != null && !searchCriteria.getColumns().isEmpty());
     }
 
-    private EntityType<?> getEntityTypeFromCache(String entityName) {
-        if (!cache.containsKey(ENTITY_PREFIX + entityName)) {
-            this.refreshEntityModelCache();
+    private EntityType<?> getEntityTypeFromCache(String entityName, Long idTrans) {
+        // ═══════════════════════════════════════════════════════════════
+        // FIX: Usar entityName como segunda clave del cache.
+        //
+        // ANTES: entityTypes era Map<Long, EntityType> — UNA sola entidad
+        // por transacción. Si la query involucraba JOINs (ej:
+        // CatEscrituraPropietario → propietario → predio → claveCat),
+        // la primera entidad cacheada (CatEscrituraPropietario) se
+        // retornaba para TODAS las búsquedas → getAttribute("claveCat")
+        // fallaba en CatEscrituraPropietario en vez de buscarlo en CatPredio.
+        //
+        // AHORA: entityTypes es Map<Long, Map<String, EntityType>>,
+        // permite cachear múltiples EntityTypes por transacción.
+        // ═══════════════════════════════════════════════════════════════
+        Map<String, EntityType> transCache = entityTypes.computeIfAbsent(idTrans, k -> new LinkedHashMap<>());
+        if (transCache.containsKey(entityName)) {
+            return transCache.get(entityName);
         }
-        return (EntityType<?>) cache.get(ENTITY_PREFIX + entityName);
+
+        String nameEntiti = ENTITY_PREFIX + entityName;
+        EntityType<?> entityType = null;
+        if (!cache.containsKey(nameEntiti)) {
+            entityType = this.refreshEntityModelCache(entityName);
+            Utilities.logs(this, "Iniciando cache de Entities: ");
+        }
+        Utilities.logs(this, "Buscando cache " + nameEntiti + " Entities en cache: " + cache.size());
+        if (entityType == null) {
+            entityType = (EntityType<?>) cache.get(nameEntiti);
+        }
+        if (entityType != null) {
+            transCache.put(entityName, entityType);
+        }
+        return entityType;
     }
 
     private Class<?> getDomainClass(EntityType<?> entityType, String entityName, BusquedaModel searchCriteria) {
         if (entityType == null) {
-            LOGGER.log(Level.INFO, "Entity not found in cache model: {0} with parameters {1}",
-                    new Object[]{entityName, searchCriteria});
+            LOGGER.log(Level.INFO, "Entity not found in cache model: {0} with parameters {1}", new Object[]{entityName, searchCriteria});
             throw new EntityNotFoundException("Entity not found: " + entityName);
         }
 
         Class<?> domainClass = entityType.getJavaType();
         if (domainClass == null) {
-            LOGGER.log(Level.INFO, "Java type not found for entity: {0} with parameters {1}",
-                    new Object[]{entityName, searchCriteria});
+            LOGGER.log(Level.INFO, "Java type not found for entity: {0} with parameters {1}", new Object[]{entityName, searchCriteria});
             throw new EntityNotFoundException("Java type not found for entity: " + entityName);
         }
+        Utilities.logs(this, "Case encontrada: " + domainClass.getSimpleName());
         return domainClass;
     }
 
     private void updateJoinMappings(Long transactionId, Class<?> domainClass) {
-        Map<String, Object> domainMapping = joinMappings.computeIfAbsent(transactionId,
-                k -> new LinkedHashMap<>());
+        Map<String, Object> domainMapping = joinMappings.computeIfAbsent(transactionId, k -> new LinkedHashMap<>());
         domainMapping.put(CLASS_TRANSLATION_PREFIX + transactionId, domainClass);
+        Utilities.logs(this, "JoinMappings peticion: " + transactionId);
     }
 
-    private CriteriaQuery<?> createAppropriateQuery(CriteriaBuilder builder,
-                                                    Class<?> domainClass, boolean isMultiColumnQuery) {
+    private CriteriaQuery<?> createAppropriateQuery(CriteriaBuilder builder, Class<?> domainClass, boolean isMultiColumnQuery) {
         return isMultiColumnQuery ? builder.createTupleQuery() : builder.createQuery(domainClass);
     }
 
@@ -139,11 +191,23 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
 
             TypedQuery<?> typedQuery = getEntityManager().createQuery(query);
 
-            Optional.ofNullable(filtros.getFirst())
-                    .ifPresent(typedQuery::setFirstResult);
+            Optional.ofNullable(filtros.getFirst()).ifPresent(typedQuery::setFirstResult);
 
-            Optional.ofNullable(filtros.getPageSize())
-                    .ifPresent(typedQuery::setMaxResults);
+            Optional.ofNullable(filtros.getPageSize()).ifPresent(typedQuery::setMaxResults);
+
+            // Hints de alto volumen
+            typedQuery.setFlushMode(FlushModeType.COMMIT);
+            typedQuery.setHint("org.hibernate.readOnly", Boolean.TRUE);
+            typedQuery.setHint("org.hibernate.cacheable", Boolean.FALSE);
+
+            try {
+                org.hibernate.query.Query<?> hq = typedQuery.unwrap(org.hibernate.query.Query.class);
+                hq.setReadOnly(true);
+                hq.setFetchSize(DEFAULT_FETCH_SIZE);
+                hq.setTimeout(Math.max(1, DEFAULT_QUERY_TIMEOUT_MS / 1000));
+            } catch (Exception ignore) {
+                if (buhoProperties.isDebug()) LOGGER.log(Level.INFO, "Error al settear hints para la consulta: {0}", ignore.getMessage());
+            }
 
             return typedQuery;
         } catch (Exception e) {
@@ -151,6 +215,114 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
             throw new IllegalStateException("Failed to create TypedQuery", e);
         }
     }
+
+    private void ensureStableOrder(Long idTrans, BusquedaModel busq, Root<?> root) {
+        try {
+            Map<String, String> orders = busq.getOrders();
+            if (orders == null || orders.isEmpty()) return;
+
+            EntityType<?> entityType = getEntityTypeFromCache(root.getJavaType().getSimpleName(), idTrans);
+            if (entityType == null) return;
+
+            String idName = entityType.getId(entityType.getIdType().getJavaType()).getName();
+
+            boolean containsId = orders.keySet().stream().map(k -> Utilities.getUltimaPosicion(k, "\\.")).anyMatch(k -> k.equals(idName));
+
+            if (!containsId) {
+                String dir = orders.values().stream().findFirst().orElse("ASC");
+                orders.put(idName, dir);
+            }
+        } catch (Exception e) {
+            LOGGER.log(Level.FINE, "ensureStableOrder error", e);
+        }
+    }
+
+    private void applySeekPagination(Long idTrans, BusquedaModel busq, CriteriaBuilder builder, CriteriaQuery<?> query, Root<?> root) {
+        if (!Boolean.TRUE.equals(busq.getSeek())) return;
+        if (busq.getCursorField() == null || busq.getCursorDirection() == null || busq.getCursorValue() == null) return;
+
+        try {
+            String key = busq.getCursorField();
+            String nameField = Utilities.getUltimaPosicion(key, "\\.");
+            From<?, ?> join = createJoin(idTrans, key, root);
+
+            EntityType<?> et = getEntityTypeFromCache(join.getJavaType().getSimpleName(), idTrans);
+            if (et == null) return;
+            Attribute<?, ?> metaField = et.getAttribute(nameField);
+            Class<?> fieldType = metaField.getJavaType();
+
+            Object cursorVal = castToType(fieldType, busq.getCursorValue());
+
+            EntityType<?> rootEt = getEntityTypeFromCache(root.getJavaType().getSimpleName(), idTrans);
+            SingularAttribute<?, ?> idAttr = rootEt.getId(rootEt.getIdType().getJavaType());
+            String idName = idAttr.getName();
+            Path<?> idPath = root.get(idName);
+
+            Predicate seekPredicate;
+
+            Object cursorIdVal = busq.getCursorIdValue();
+            if (cursorIdVal != null) {
+                Object castIdVal = castToType(idAttr.getJavaType(), cursorIdVal);
+                Predicate main;
+                Predicate tie;
+                Predicate eq;
+
+                if ("ASC".equalsIgnoreCase(busq.getCursorDirection())) {
+                    main = builder.greaterThan(join.get(nameField), (Comparable) cursorVal);
+                    tie = builder.greaterThan((Expression<? extends Comparable>) idPath, (Comparable) castIdVal);
+                } else {
+                    main = builder.lessThan(join.get(nameField), (Comparable) cursorVal);
+                    tie = builder.lessThan((Expression<? extends Comparable>) idPath, (Comparable) castIdVal);
+                }
+                eq = builder.equal(join.get(nameField), cursorVal);
+                seekPredicate = builder.or(main, builder.and(eq, tie));
+            } else {
+                if ("ASC".equalsIgnoreCase(busq.getCursorDirection())) {
+                    seekPredicate = builder.greaterThan(join.get(nameField), (Comparable) cursorVal);
+                } else {
+                    seekPredicate = builder.lessThan(join.get(nameField), (Comparable) cursorVal);
+                }
+            }
+
+            Predicate existing = query.getRestriction();
+            if (existing != null) {
+                query.where(builder.and(existing, seekPredicate));
+            } else {
+                query.where(seekPredicate);
+            }
+        } catch (Exception e) {
+            LOGGER.log(Level.FINE, "applySeekPagination error", e);
+        }
+    }
+
+    private Object castToType(Class<?> type, Object val) {
+        if (val == null) return null;
+        try {
+            if (type == String.class) return val.toString();
+            if (type == Integer.class || type == int.class) return Integer.valueOf(val.toString());
+            if (type == Long.class || type == long.class) return Long.valueOf(val.toString());
+            if (type == Double.class || type == double.class) return Double.valueOf(val.toString());
+            if (type == Float.class || type == float.class) return Float.valueOf(val.toString());
+            if (type == Short.class || type == short.class) return Short.valueOf(val.toString());
+            if (type == Byte.class || type == byte.class) return Byte.valueOf(val.toString());
+            if (type == Boolean.class || type == boolean.class) return Boolean.valueOf(val.toString());
+            if (type == java.math.BigDecimal.class) return new java.math.BigDecimal(val.toString());
+            if (type == java.util.Date.class) {
+                if (val instanceof java.util.Date) return val;
+                try {
+//                    return DatatypeConverter.parseDateTime(val.toString()).getTime();
+                    return new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss").parse(val.toString());
+                } catch (Exception ignore) {
+                    return new java.text.SimpleDateFormat("yyyy-MM-dd").parse(val.toString());
+                }
+            }
+            return val;
+        } catch (Exception e) {
+            LOGGER.log(Level.FINE, "castToType fallback " + type + " val: " + val, e);
+            return val;
+        }
+    }
+
 
     private <T> List getList(BusquedaModel busq, boolean isTuple, CriteriaQuery query) {
         TypedQuery tq = criteriaDistinct(busq, query);
@@ -161,19 +333,20 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
         if (isTuple) {
             List<Map<String, Object>> resultp = new ArrayList<>();
             for (Tuple single : (List<Tuple>) tuples) {
-                Map<String, Object> tempMap = new HashMap<>();
-                single.getElements().forEach((v) -> {
-//                    if (v instanceof ParameterizedFunctionExpression) {
-//                        ParameterizedFunctionExpression d = (ParameterizedFunctionExpression) v;
-//                        if (d.getFunctionName() != null) {
-//                            tempMap.put(d.getFunctionName(), single.get(d.getFunctionName()));
-//                        }
-//                    } else {
-//                        SingularAttributePath path = (SingularAttributePath) v;
-//                        if (path.getAttribute().getName() != null) {
-//                            tempMap.put(path.getAttribute().getName(), single.get(path.getAttribute().getName()));
-//                        }
-//                    }
+                Map<String, Object> tempMap = new LinkedHashMap<>();
+                single.getElements().forEach((element) -> {
+                    String alias = element.getAlias();
+                    if (alias != null && !alias.isEmpty()) {
+                        tempMap.put(alias, single.get(alias));
+                    } else {
+                        // Fallback: usar índice si no hay alias
+                        int idx = tempMap.size();
+                        try {
+                            tempMap.put("col_" + idx, single.get(idx));
+                        } catch (Exception ignore) {
+                            // Elemento sin acceso por índice
+                        }
+                    }
                 });
                 resultp.add(tempMap);
             }
@@ -224,40 +397,118 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
             if (j == null) {
                 j = new LinkedHashMap<>();
             }
-            String joinKey = key.substring(0, (key.lastIndexOf(".") > 0 ? key.lastIndexOf(".") : key.length()));
+            String joinKey = key.contains(".") ? key.substring(0, key.lastIndexOf(".")) : key;
+
             if (j.containsKey(joinKey)) {
                 return (From) j.get(joinKey);
-            } else {
-                From join = from;
-                String[] split = key.split("\\.");
-                int index = 0;
-                for (String sp : split) {
-                    if (index == 0 && split.length > 1) {
-                        Class c = from.get(sp).getJavaType();
-                        if (c.getSimpleName().endsWith("PK") || c.isAnnotationPresent(Embeddable.class)) {
-                            join = from;
-                        } else {
-                            join = from.join(sp);
-                        }
-                    } else if (index < (split.length - 1)) {
-                        Class c = join.get(sp).getJavaType();
-                        if (c.getSimpleName().endsWith("PK") || c.isAnnotationPresent(Embeddable.class)) {
-                            join = from;
-                        } else {
-                            join = join.join(sp);
-                        }
-                    }
-                    index++;
-                }
-                j.put(joinKey, join);
-                joinMappings.put(idTrans, j);
-                return join;
             }
+
+            From join = from;
+            String[] pathParts = key.split("\\.");
+            if (pathParts.length <= 1) {
+                return from;
+            }
+
+            StringBuilder currentPath = new StringBuilder();
+
+            for (int i = 0; i < pathParts.length - 1; i++) {
+                String part = pathParts[i];
+
+                if (currentPath.length() > 0) currentPath.append(".");
+                currentPath.append(part);
+                String currentPathStr = currentPath.toString();
+
+                if (j.containsKey(currentPathStr)) {
+                    join = (From) j.get(currentPathStr);
+                    continue;
+                }
+
+                Class<?> attributeType = join.get(part).getJavaType();
+
+                boolean isEntity = attributeType.isAnnotationPresent(Entity.class) &&
+                                   !isBasicType(attributeType) &&
+                                   !attributeType.isAnnotationPresent(Embeddable.class) &&
+                                   !attributeType.getSimpleName().endsWith("PK");
+
+                if (isEntity) {
+                    join = join.join(part, JoinType.INNER);
+                    LOGGER.fine("Created JOIN: " + currentPathStr + " -> " + join.getJavaType().getSimpleName());
+                } else {
+                    LOGGER.fine("Skip JOIN for: " + currentPathStr + " (type: " + attributeType.getSimpleName() + ")");
+                }
+                j.put(currentPathStr, join);
+            }
+
+            joinMappings.put(idTrans, j);
+            return join;
+
         } catch (Exception e) {
             LOGGER.log(Level.SEVERE, "findProperty key " + key, e);
         }
         return null;
     }
+
+    private boolean isBasicType(Class<?> clazz) {
+        if (clazz.isAnnotationPresent(Embeddable.class) ||
+            clazz.isAnnotationPresent(Entity.class)) {
+            return false;
+        }
+
+        if (clazz.isPrimitive() || isWrapperType(clazz)) {
+            return true;
+        }
+
+        if (clazz.equals(String.class) || clazz.equals(Character.class)) {
+            return true;
+        }
+
+        if (clazz.isEnum()) {
+            return true;
+        }
+
+        if (Number.class.isAssignableFrom(clazz) ||
+            clazz.equals(java.math.BigDecimal.class) ||
+            clazz.equals(java.math.BigInteger.class)) {
+            return true;
+        }
+
+        if (isTemporalType(clazz)) {
+            return true;
+        }
+
+        if (clazz.equals(java.util.UUID.class) ||
+            clazz.equals(java.util.Locale.class)) {
+            return true;
+        }
+
+        return false;
+    }
+
+    private boolean isWrapperType(Class<?> clazz) {
+        return clazz.equals(Boolean.class) ||
+               clazz.equals(Byte.class) ||
+               clazz.equals(Short.class) ||
+               clazz.equals(Integer.class) ||
+               clazz.equals(Long.class) ||
+               clazz.equals(Float.class) ||
+               clazz.equals(Double.class) ||
+               clazz.equals(Character.class);
+    }
+
+    private boolean isTemporalType(Class<?> clazz) {
+        return java.util.Date.class.isAssignableFrom(clazz) ||
+               java.time.temporal.Temporal.class.isAssignableFrom(clazz) ||
+               clazz.equals(java.time.LocalDate.class) ||
+               clazz.equals(java.time.LocalDateTime.class) ||
+               clazz.equals(java.time.LocalTime.class) ||
+               clazz.equals(java.time.OffsetDateTime.class) ||
+               clazz.equals(java.time.ZonedDateTime.class) ||
+               clazz.equals(java.time.Instant.class) ||
+               clazz.equals(java.time.Year.class) ||
+               clazz.equals(java.time.Month.class) ||
+               clazz.equals(java.time.YearMonth.class);
+    }
+
 
     private void processGroupBy(Long idTrans, BusquedaModel busq, CriteriaQuery query, Root from) {
         try {
@@ -276,6 +527,7 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
                     }
                 });
                 query.groupBy(groups);
+                Utilities.logs(this, "Procesando grupos de agrupacion");
             }
         } catch (Exception e) {
             LOGGER.log(Level.SEVERE, "", e);
@@ -359,7 +611,9 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
             });
             if (ordersby.size() > 0) {
                 query.orderBy(ordersby);
+                Utilities.logs(this, "Procesando ordenaciones " + ordersby.size());
             }
+            Utilities.logs(this, "Sin ordenaciones");
         } catch (Exception e) {
             LOGGER.log(Level.SEVERE, "", e);
         }
@@ -406,12 +660,42 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
                         }
                     }
                 });
-//                if (multSele.size() > 1) {
                 query.multiselect(multSele);
-//                } else {
-//                    query.select(multSele.get(0));
-//                }
+                Utilities.logs(this, "Procesando columnas");
+
+            } else if (busq.getColumns() != null && !busq.getColumns().isEmpty()) {
+                // ═══════════════════════════════════════════════════════════════
+                // COLUMNS: Selección de columnas específicas.
+                // Soporta rutas con joins: "propietario.predio.claveCat"
+                // Genera: SELECT col1, col2, col3 ... en vez de SELECT *
+                // Resultado: List<Map<String, Object>> con alias como keys
+                // ═══════════════════════════════════════════════════════════════
+                List<Selection<?>> selections = new ArrayList<>(busq.getColumns().size());
+                for (String col : busq.getColumns()) {
+                    String nameField = Utilities.getUltimaPosicion(col, "\\.");
+                    From join = createJoin(idTrans, col, from);
+                    if (join == null) {
+                        join = from;
+                    }
+                    try {
+                        // Usar el nombre completo como alias para identificar en el resultado
+                        Path path = join.get(nameField);
+                        selections.add(path.alias(col));
+                    } catch (Exception e) {
+                        LOGGER.log(Level.WARNING, "Column no encontrada: " + col + " en " + join.getJavaType().getSimpleName(), e);
+                    }
+                }
+                if (!selections.isEmpty()) {
+                    query.multiselect(selections);
+                    Utilities.logs(this, "Procesando columns: " + busq.getColumns().size() + " columnas seleccionadas");
+                } else {
+                    Utilities.logs(this, "Ninguna columna válida, seleccionando entidad completa");
+                    query.select(from);
+                }
+
             } else {
+
+                Utilities.logs(this, "Procesando toda la entidad");
                 query.select(from);
             }
         } catch (Exception f) {
@@ -433,9 +717,11 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
         try {
             List<Predicate> predicates = new ArrayList<>();
             if (filtros == null) {
+                Utilities.logs(this, "Predicates agregados al query 0");
                 return new Predicate[0];
             }
             if (filtros.size() == 0) {
+                Utilities.logs(this, "Predicates agregados al query 0");
                 return new Predicate[0];
             }
             filtros.entrySet().forEach((Map.Entry<String, Object> entry) -> {
@@ -451,11 +737,15 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
                     From join = from;
                     String nameField = Utilities.getUltimaPosicion(key, "\\.");
                     try {
-                        join = this.createJoin(idTrans, key, from);
-                        findProperty = this.getPredicateField(idTrans, builder, nameField, join, condicion, from, null);
+                        join = createJoin(idTrans, key, from);
+                        if (join == null) {
+                            LOGGER.log(Level.WARNING, "createJoin retornó null para key: " + key + ", usando root");
+                            join = from;
+                        }
+                        findProperty = getPredicateField(idTrans, builder, nameField, join, condicion, from, null);
                     } catch (Exception e) {
-                        System.out.println("Error al buscar NameField " + nameField + " " + condicion + " Join.getJavaType() " + join.getJavaType());
-                        LOGGER.log(Level.SEVERE, "findProperty key " + key, e);
+                        LOGGER.log(Level.WARNING, "Error al buscar NameField " + nameField + " condicion " + condicion
+                                                  + " Join type " + (join != null ? join.getJavaType().getSimpleName() : "null"), e);
                     }
                     if (findProperty != null) {
                         predicates.add(findProperty);
@@ -466,8 +756,10 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
                 Predicate[] result = new Predicate[predicates.size()];
                 result = predicates.toArray(result);
                 query.where(predicates.toArray(result));
+                Utilities.logs(this, "Predicates agregados al query : " + predicates.size());
                 return result;
             }
+            Utilities.logs(this, "Predicates agregados al query 0");
         } catch (Exception e) {
             System.out.println("BusquedaDinamica " + filtros);
             LOGGER.log(Level.SEVERE, "", e);
@@ -487,16 +779,14 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
      * @return Predicado sobre el join realizado
      */
     private Predicate getPredicateField(Long idTrans, CriteriaBuilder builder, String nameField, From join, BusquedaModel.WhereCondition condicion, Root from, BusquedaModel.WhereCondition condicionPrin) {
+        String clazzNameJoin = join.getJavaType().getSimpleName();
         try {
-//            if (!cache.containsKey(entityModel + join.getJavaType().getSimpleName())) {
-//                this.addCacheEntityModel();
-//            }
-            EntityType o = (EntityType) cache.get(ENTITY_PREFIX + join.getJavaType().getSimpleName());
+            EntityType o = getEntityTypeFromCache(clazzNameJoin, idTrans);
             Attribute metaField = null;
             Expression path = null;
             if (!nameField.equalsIgnoreCase("SELECTCASE")) {
                 if (o == null) {
-                    System.out.println(join.getJavaType().getSimpleName() + " No se encontro referencia a " + nameField);
+                    System.out.println(clazzNameJoin + " No se encontro referencia a " + nameField);
                     return null;
                 }
                 metaField = o.getAttribute(nameField);
@@ -510,7 +800,7 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
                 }
             }
             if (condicion == null || condicion.getComparador() == null) {
-                LOGGER.log(Level.INFO, "---> EntityModel " + (ENTITY_PREFIX + join.getJavaType().getSimpleName()) + " nameField " + nameField + " condicion " + condicion);
+                LOGGER.log(Level.INFO, "---> EntityModel No tiene comparador " + (ENTITY_PREFIX + clazzNameJoin) + " nameField " + nameField + " condicion " + condicion);
                 return null;
             }
             switch (condicion.getComparador().toUpperCase()) {
@@ -575,24 +865,18 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
                     Object value = condicion.getValuesCast(metaField.getJavaType()).get(0);
                     if (value instanceof Comparable) {
                         return builder.lessThan(path, (Comparable) value);
-                    } else {
-                        return builder.equal(path, value);
                     }
                 case "LTE":
                 case "<=":
                     Object value1 = condicion.getValuesCast(metaField.getJavaType()).get(0);
                     if (value1 instanceof Comparable) {
                         return builder.lessThanOrEqualTo(path, (Comparable) value1);
-                    } else {
-                        return builder.equal(path, value1);
                     }
                 case "GT":
                 case ">":
                     Object value2 = condicion.getValuesCast(metaField.getJavaType()).get(0);
                     if (value2 instanceof Comparable) {
                         return builder.greaterThan(path, (Comparable) value2);
-                    } else {
-                        return builder.equal(path, value2);
                     }
                 case "GTE":
                 case ">=":
@@ -600,8 +884,6 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
 //                    System.out.println("--> " + value3 + " --> " + metaField.getJavaType());
                     if (value3 instanceof Comparable) {
                         return builder.greaterThanOrEqualTo(path, (Comparable) value3);
-                    } else {
-                        return builder.equal(path, value3);
                     }
                 case "BETWEEN":
                     List<Object> valuesCast = condicion.getValuesCast(metaField.getJavaType());
@@ -703,29 +985,31 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
                     }
                     return builder.or(ors.toArray(new Predicate[]{}));
                 case "AND":
-                    List<Predicate> ands = new ArrayList<>(condicion.getValues().size());
-                    for (Object cd : condicion.getValues()) {
-                        BusquedaModel.WhereCondition v = null;
-                        try {
-                            if (!cd.toString().startsWith("{")) {
+                    if (Utilities.isNotEmpty(condicion.getValues())) {
+                        List<Predicate> ands = new ArrayList<>(condicion.getValues().size());
+                        for (Object cd : condicion.getValues()) {
+                            BusquedaModel.WhereCondition v = null;
+                            try {
+                                if (!cd.toString().startsWith("{")) {
 //                                v = new BusquedaDinamica.WhereCondition("AND", Arrays.asList(cd));
-                            } else {
-                                v = (BusquedaModel.WhereCondition) Utilities.toObjectFromJson(cd.toString(), BusquedaModel.WhereCondition.class);
+                                } else {
+                                    v = (BusquedaModel.WhereCondition) Utilities.toObjectFromJson(cd.toString(), BusquedaModel.WhereCondition.class);
+                                }
+                            } catch (Exception e) {
+                                System.out.println("No es js " + e.getMessage());
+                                v = new BusquedaModel.WhereCondition(null, null);
                             }
-                        } catch (Exception e) {
-                            System.out.println("No es js " + e.getMessage());
-                            v = new BusquedaModel.WhereCondition(null, null);
+                            if (v.getComparador() == null && cd.toString().startsWith("{")) {
+                                analizarOrPred(idTrans, builder, from, ands, cd, condicion, null);
+                            } else if (v.getComparador() != null) {
+                                ands.add(this.getPredicateField(idTrans, builder, nameField, join, v, from, condicion));
+                            } else {
+                                BusquedaModel.WhereCondition oc = new BusquedaModel.WhereCondition(Arrays.asList(cd));
+                                ands.add(this.getPredicateField(idTrans, builder, nameField, join, oc, from, condicion));
+                            }
                         }
-                        if (v.getComparador() == null && cd.toString().startsWith("{")) {
-                            analizarOrPred(idTrans, builder, from, ands, cd, condicion, null);
-                        } else if (v.getComparador() != null) {
-                            ands.add(this.getPredicateField(idTrans, builder, nameField, join, v, from, condicion));
-                        } else {
-                            BusquedaModel.WhereCondition oc = new BusquedaModel.WhereCondition(Arrays.asList(cd));
-                            ands.add(this.getPredicateField(idTrans, builder, nameField, join, oc, from, condicion));
-                        }
+                        return builder.and(ands.toArray(new Predicate[]{}));
                     }
-                    return builder.and(ands.toArray(new Predicate[]{}));
                 default:
                     Object v = null;
                     if (metaField.getJavaType().equals(String.class) || metaField.getJavaType().equals(Character.class)) {
@@ -752,14 +1036,17 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
                         cal.add(Calendar.SECOND, -1);
                         return builder.between(path, date, cal.getTime());
                     } else {
-                        return builder.equal(path, v);
+                        if (v != null) {
+                            return builder.equal(path, v);
+                        }
                     }
             }
         } catch (Exception e) {
-            System.out.println("----->entityModel " + (ENTITY_PREFIX + join.getJavaType().getSimpleName()) + " nameField " + nameField + " condicion " + condicion);
+            System.out.println("----->entityModel " + (ENTITY_PREFIX + clazzNameJoin) + " nameField " + nameField + " condicion " + condicion);
             LOGGER.log(Level.SEVERE, "entityModel", e);
             return null;
         }
+        return null;
     }
 
     private Predicate getPredicatelLike(Long idTrans, CriteriaBuilder builder, String nameField, From join, BusquedaModel.WhereCondition condicion, Root from, Expression path, int i, boolean negado, BusquedaModel.WhereCondition condicionPrin) {
@@ -822,7 +1109,7 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
         }
     }
 
-    private void analizarOrPred(Long idTrans, CriteriaBuilder builder, Root from, List<Predicate> ors, Object cd, BusquedaModel.WhereCondition condicion, String nameField) {
+    private void analizarOrPred(Long idTrans, CriteriaBuilder builder, Root from, List<Predicate> ors, Object cd, org.angbyte.model.BusquedaModel.WhereCondition condicion, String nameField) {
         if (cd != null) {
             if (cd instanceof String && cd.toString().startsWith("{")) {
                 try {
@@ -861,10 +1148,14 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
     }
 
 
-    private void buildQuery(Long transactionId, BusquedaModel searchCriteria,
-                            CriteriaBuilder builder, CriteriaQuery<?> query, Root<?> root) {
+    private void buildQuery(Long transactionId, BusquedaModel searchCriteria, CriteriaBuilder builder, CriteriaQuery<?> query, Root<?> root) {
         processFunction(transactionId, searchCriteria, builder, query, root);
         processWhere(transactionId, builder, root, searchCriteria.getFilters(), query);
+        // Aplica seek (agrega predicado al WHERE)
+        applySeekPagination(transactionId, searchCriteria, builder, query, root);
+        // Asegura orden estable (agrega PK a los Orders si falta)
+        ensureStableOrder(transactionId, searchCriteria, root);
+
         processGroupBy(transactionId, searchCriteria, query, root);
         processOrderBY(transactionId, builder, root, searchCriteria.getOrders(), query);
     }
@@ -877,18 +1168,14 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
      */
     public Class<?> getEntityClass(String entityName) {
         try {
-            String cacheKey = ENTITY_PREFIX + entityName;
-            if (!cache.containsKey(cacheKey)) {
-                refreshEntityModelCache();
-            }
+            Long transsaction = getIdTrans();
+            EntityType entityType = getEntityTypeFromCache(entityName, transsaction);
 
-            EntityType<?> entityType = (EntityType<?>) cache.get(cacheKey);
             if (entityType == null) {
                 LOGGER.log(Level.INFO, "No cached entity model found for {0}", entityName);
                 return null;
             }
-            if (buhoProperties.isDebug())
-                LOGGER.log(Level.INFO, "Caching entity model for {0}", entityType.getName());
+            if (buhoProperties.isDebug()) LOGGER.log(Level.INFO, "Obtener cache para {0}", entityType.getName());
             return entityType.getJavaType();
         } catch (Exception e) {
             LOGGER.log(Level.SEVERE, "Error retrieving entity class for " + entityName, e);
@@ -901,9 +1188,8 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
         if (entity == null) {
             return null;
         }
-        Object managedEntity = entityManager.merge(entity);
-        entityManager.flush();
-        return managedEntity;
+
+        return saveUpdate(entity);
 
     }
 
@@ -917,7 +1203,6 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
      *
      * @param searchCriteria Modelo con los datos para la busqueda
      * @param <T>            Cualquier tipo de dato
-     * @return Listado con los registro encontrado, si el un multiselect devuelve un listado Map<Strng, Object>, caso contrario el listado de la misma entidad.
      */
     public <T> Optional<List<T>> findAllDynamic(BusquedaModel searchCriteria) {
         try {
@@ -925,7 +1210,7 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
             Long transactionId = getIdTrans();
             boolean isMultiColumnQuery = isMultiColumnQuery(searchCriteria);
 
-            EntityType<?> entityType = getEntityTypeFromCache(entityName);
+            EntityType<?> entityType = getEntityTypeFromCache(entityName, transactionId);
             Class<?> domainClass = getDomainClass(entityType, entityName, searchCriteria);
 
             updateJoinMappings(transactionId, domainClass);
@@ -936,8 +1221,30 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
 
             buildQuery(transactionId, searchCriteria, builder, query, root);
 
-            joinMappings.remove(transactionId);
-            return Optional.ofNullable(getList(searchCriteria, isMultiColumnQuery, query));
+            removeTranssaction(transactionId);
+
+            List resultList = getList(searchCriteria, isMultiColumnQuery, query);
+            if (Boolean.TRUE.equals(searchCriteria.getResolverDto())) {
+                ClassPathScanningCandidateComponentProvider scanner = new ClassPathScanningCandidateComponentProvider(true);
+                scanner.addIncludeFilter(new AnnotationTypeFilter(Mapper.class));
+                for (BeanDefinition bd : scanner.findCandidateComponents("org.ventanilla.interna.mappers")) {
+                    Class aClass = Class.forName(bd.getBeanClassName());
+                    String classMapper = searchCriteria.getEntity() + "Mapper";
+                    if (aClass.getSimpleName().startsWith(classMapper)) {
+                        Object instance = aClass.newInstance();
+                        Method[] method = aClass.getMethods();
+                        for (Method m : method) {
+                            Class<?>[] types = m.getParameterTypes();
+                            if ("toDto".equals(m.getName()) && types[0].equals(List.class)) {
+                                System.out.println(aClass.getSimpleName() + " Encontrado " + m + " Lista toDto: " + (resultList == null ? "0" : resultList.size()));
+                                List rsdto = (List) m.invoke(instance, resultList);
+                                return Optional.ofNullable(rsdto);
+                            }
+                        }
+                    }
+                }
+            }
+            return Optional.ofNullable(resultList);
         } catch (Exception e) {
             LOGGER.log(Level.SEVERE, "Error executing dynamic query", e);
             return Optional.empty();
@@ -946,29 +1253,29 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
 
     @Override
     public <T> List<T> findAllDinamic(BusquedaModel filtros) {
-        return List.of();
+        Optional<List<Object>> optionalObjects = findAllDynamic(filtros);
+        if (optionalObjects.isPresent()) {
+            return (List<T>) optionalObjects.get();
+        }
+        return null;
     }
 
     /**
      * Implementación para la busqueda dinamica
      *
-     * @param busq    Modelo con los datos para la busqueda
-     * @param headers Parametro para agregar en el Header de la respuesta el rootSize con el conteo de los datos encontrados en la consulta.
-     * @param <T>     Cualquier tipo de dato
-     * @return Listado con los registro encontrado, si el un multiselect devuelve un listado Map<Strng, Object>, caso contrario el listado de la misma entidad.
+     * @param searchCriteria Modelo con los datos para la busqueda
+     * @param headers        Parametro para agregar en el Header de la respuesta el rootSize con el conteo de los datos encontrados en la consulta.
+     * @param <T>            Cualquier tipo de dato
+     * @return Listado con los registro encontrado, si el un multiselect devuelve un listado Map, caso contrario el listado de la misma entidad.
      */
-    public <T> List<T> findAllDinamic(BusquedaModel busq, MultiValueMap<String, String> headers) {
-        String nameClazz = busq.getEntity();
+    public <T> List<T> findAllDinamic(BusquedaModel searchCriteria, MultiValueMap<String, String> headers) {
+        String nameClazz = searchCriteria.getEntity();
         try {
             Long idTrans = getIdTrans();
-            boolean isTuple = busq.getFunctions() != null && busq.getFunctions().size() > 0;
-            if (!cache.containsKey(ENTITY_PREFIX + nameClazz)) {
-                this.refreshEntityModelCache();
-            }
+            EntityType o = getEntityTypeFromCache(nameClazz, idTrans);
             Long count = 0L;
-            EntityType o = (EntityType) cache.get(ENTITY_PREFIX + nameClazz);
             if (o == null) {
-                LOGGER.log(Level.INFO, "No existe objeto " + nameClazz + " con parametros " + busq);
+                LOGGER.log(Level.INFO, "No existe objeto " + nameClazz + " con parametros " + searchCriteria);
                 return null;
             }
 
@@ -980,74 +1287,48 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
             mapClazzDonm.put(CLASS_TRANSLATION_PREFIX + idTrans, domainClass);
             joinMappings.put(idTrans, mapClazzDonm);
             if (domainClass == null) {
-                LOGGER.log(Level.INFO, "No existe objeto " + nameClazz + " con parametros " + busq);
+                LOGGER.log(Level.INFO, "No existe objeto " + nameClazz + " con parametros " + searchCriteria);
                 return null;
             }
             CriteriaBuilder builder = this.getEntityManager().getCriteriaBuilder();
-            CriteriaQuery query = builder.createQuery(domainClass);
-            Root from = query.from(domainClass);
-            if (isTuple) {
-                query = builder.createTupleQuery();
-                from = query.from(domainClass);
-            } else {
-                query.select(from);
+            List resultList = null;
+            Optional<List<Object>> optionalObjects = findAllDynamic(searchCriteria);
+            if (optionalObjects.isPresent()) {
+                resultList = optionalObjects.get();
             }
-            processFunction(idTrans, busq, builder, query, from);
-            Predicate[] preds = processWhere(idTrans, builder, from, busq.getFilters(), query);
-            processGroupBy(idTrans, busq, query, from);
-            processOrderBY(idTrans, builder, from, busq.getOrders(), query);
-            joinMappings.remove(idTrans);
-            List resultList = getList(busq, isTuple, query);
+            Utilities.logs(this, "Datos procesados ", resultList);
             // Para realizar el conteo
-            CriteriaQuery<Long> countQuery = builder.createQuery(Long.class);
-            from = countQuery.from(domainClass);
-            this.joinMappings.remove(idTrans);
-            preds = processWhere(idTrans, builder, from, busq.getFilters(), countQuery);
-            if (busq.getDistinct() != null && busq.getDistinct().equals(true)) {
-                countQuery.select(builder.countDistinct(from));
-            } else {
-                countQuery.select(builder.count(from));
-            }
-            if (preds != null) {
-                countQuery.where(preds);
-            }
-            count = this.getEntityManager().createQuery(countQuery).getSingleResult();
+            count = countData(searchCriteria, builder, domainClass, idTrans);
             if (headers != null) {
                 headers.add("rootSize", (count == null ? "0" : count.toString()));
             }
-            this.joinMappings.remove(idTrans);
-
-            if (Boolean.TRUE.equals(busq.getResolverDto())) {
-                ClassPathScanningCandidateComponentProvider scanner = new ClassPathScanningCandidateComponentProvider(true);
-                scanner.addIncludeFilter(new AnnotationTypeFilter(Mapper.class));
-                for (BeanDefinition bd : scanner.findCandidateComponents("org.ventanilla.interna.mappers")) {
-                    Class aClass = Class.forName(bd.getBeanClassName());
-                    String classMapper = busq.getEntity() + "Mapper";
-                    if (aClass.getSimpleName().startsWith(classMapper)) {
-                        Object instance = aClass.newInstance();
-                        Method[] method = aClass.getMethods();
-                        for (Method m : method) {
-                            Class<?>[] types = m.getParameterTypes();
-                            if ("toDto".equals(m.getName()) && types[0].equals(List.class)) {
-                                System.out.println(aClass.getSimpleName() + " Encontrado " + m + " Lista toDto: " + (resultList == null ? "0" : resultList.size()));
-                                List rsdto = (List) m.invoke(instance, resultList);
-                                return rsdto;
-                            }
-
-                        }
-
-                    }
-                }
-                return resultList;
-            } else {
-                return resultList;
-            }
+            Utilities.logs(this, "Registros encontrados", count);
+            removeTranssaction(idTrans);
+            return resultList;
         } catch (Exception e) {
-            LOGGER.log(Level.INFO, "Transaccion parametros " + busq);
+            LOGGER.log(Level.INFO, "Transaccion parametros " + searchCriteria);
             LOGGER.log(Level.SEVERE, "", e);
             headers.add("Error", e.getMessage());
             return null;
         }
+    }
+
+    private Long countData(BusquedaModel searchCriteria, CriteriaBuilder builder, Class domainClass, Long idTrans) {
+        Long count;
+        CriteriaQuery<Long> countQuery = builder.createQuery(Long.class);
+        Root from = countQuery.from(domainClass);
+        removeTranssaction(idTrans);
+        Predicate[] preds = processWhere(idTrans, builder, from, searchCriteria.getFilters(), countQuery);
+        if (searchCriteria.getDistinct() != null && searchCriteria.getDistinct().equals(true)) {
+            countQuery.select(builder.countDistinct(from));
+        } else {
+            countQuery.select(builder.count(from));
+        }
+        if (Utilities.isNotEmpty(preds)) {
+            countQuery.where(preds);
+        }
+        count = this.getEntityManager().createQuery(countQuery).getSingleResult();
+        return count;
     }
 
     /**
@@ -1062,6 +1343,7 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
         return null;
     }
 
+    @Override
     @Transactional
     public Respuesta save(GuardarModel model) {
         Respuesta rws = new Respuesta();
@@ -1078,11 +1360,9 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
             if (model.getData() == null) {
                 msg += Messages.NO_DATO_ERROR_MENSAJE + " del cuerpo del Objeto" + "\n";
             }
-            if (!cache.containsKey(ENTITY_PREFIX + model.getEntity())) {
-                this.refreshEntityModelCache();
-            }
+            Long transsaction = getIdTrans();
             rws.setMensaje(msg);
-            EntityType o = (EntityType) cache.get(ENTITY_PREFIX + model.getEntity());
+            EntityType o = getEntityTypeFromCache(model.getEntity(), transsaction);
             if (o == null) {
                 msg += "No existe objeto " + model.getEntity() + " con parametros " + model.getEntity() + "\n";
                 System.out.println(model);
@@ -1179,6 +1459,7 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
 //                rws.setMensaje(Mensajes.DATOS_NO_GUARDADOS);
             }
             System.out.println("Respuesta guardado generico " + rws);
+            removeTranssaction(transsaction);
             return rws;
         } catch (Exception e) {
             rws.setEstado(false);
@@ -1189,10 +1470,11 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
         return rws;
     }
 
+    @Override
     @Transactional
-    public Object save(Object entity) {
+    public Object saveUpdate(Object entity) {
         try {
-            EntityType o = (EntityType) cache.get(ENTITY_PREFIX + entity.getClass().getSimpleName());
+            EntityType o = getEntityTypeFromCache(entity.getClass().getSimpleName(), getIdTrans());
             SingularAttribute id = o.getDeclaredId(o.getIdType().getJavaType());
             Field field = entity.getClass().getDeclaredField(id.getName());
             field.setAccessible(true);
@@ -1210,22 +1492,33 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
         }
     }
 
-
-    @Transactional(propagation = Propagation.REQUIRED)
-    public Object save1(Object entity) {
+    /**
+     * Guarda lista de objetos sin validación.
+     *
+     * @param list Lista de objetos guardados.
+     */
+    @Override
+    @Transactional
+    public Collection saveAll(Collection list) {
         try {
-            this.getEntityManager().joinTransaction();
-//            this.getEm().getTransaction().begin();
+            Collection saved = new ArrayList(list.size());
+            int i = 0;
+
+            for (Object entity : list) {
+                saved.add(saveUpdate(entity));
+                if (++i % JDBC_BATCH_SIZE == 0) {
+                    this.getEntityManager().flush();
+                    this.getEntityManager().clear();
+                }
+            }
+            this.getEntityManager().flush();
             this.getEntityManager().clear();
-            this.getEntityManager().persist(entity);
-//            this.getEm().getTransaction().commit();
-//            this.getEm().flush();
-//            this.getEm().refresh(entity);
-            return entity;
+            return saved;
         } catch (Exception e) {
-            LOGGER.log(Level.SEVERE, "-->", e);
-            return null;
+            LOGGER.log(Level.SEVERE, "--> Error el persistir entidad ", e);
+            this.getEntityManager().getTransaction().rollback();
         }
+        return null;
     }
 
     @Transactional
@@ -1323,39 +1616,12 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
         return null;
     }
 
-    /**
-     * Guarda lista de objetos sin validación.
-     *
-     * @param list Lista de objetos guardados.
-     */
-//    @Override
-    @Transactional
-    public Collection saveAll(Collection list) {
-        try {
-            Collection c = new ArrayList(list.size());
-            for (Object entity : list) {
-                this.getEntityManager().persist(entity);
-                this.getEntityManager().refresh(entity);
-                c.add(entity);
-            }
-            return c;
-        } catch (Exception e) {
-            LOGGER.log(Level.SEVERE, "--> Error el persistir entidad ", e);
-            this.getEntityManager().getTransaction().rollback();
-        }
-        return null;
-    }
-
-    @Transactional(readOnly = true)
     public Object find(BusquedaModel busq) {
         try {
             String nameClazz = busq.getEntity();
-            Long idTrans = getIdTrans();
-            boolean isTuple = busq.getFunctions() != null && busq.getFunctions().size() > 1;
-            if (!cache.containsKey(ENTITY_PREFIX + nameClazz)) {
-                this.refreshEntityModelCache();
-            }
-            EntityType o = (EntityType) cache.get(ENTITY_PREFIX + nameClazz);
+            Long transsaction = getIdTrans();
+            boolean isTuple = isMultiColumnQuery(busq);
+            EntityType o = getEntityTypeFromCache(busq.getEntity(), transsaction);
             if (o == null) {
                 LOGGER.log(Level.INFO, "(find) No existe objeto en cache model " + nameClazz + " con parametros " + busq);
                 return null;
@@ -1365,23 +1631,23 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
                 LOGGER.log(Level.INFO, "No existe objeto " + nameClazz + " con parametros " + busq);
                 return null;
             }
-            Map<String, Object> mapClazzDonm = joinMappings.get(idTrans);
+            Map<String, Object> mapClazzDonm = joinMappings.get(transsaction);
             if (mapClazzDonm == null) {
                 mapClazzDonm = new LinkedHashMap<>();
             }
-            mapClazzDonm.put(CLASS_TRANSLATION_PREFIX + idTrans, domainClass);
-            joinMappings.put(idTrans, mapClazzDonm);
+            mapClazzDonm.put(CLASS_TRANSLATION_PREFIX + transsaction, domainClass);
+            joinMappings.put(transsaction, mapClazzDonm);
             CriteriaBuilder builder = this.getEntityManager().getCriteriaBuilder();
             CriteriaQuery query = builder.createQuery(domainClass);
             if (isTuple) {
                 query = builder.createTupleQuery();
             }
             Root from = query.from(domainClass);
-            processFunction(idTrans, busq, builder, query, from);
-            processWhere(idTrans, builder, from, busq.getFilters(), query);
-            processGroupBy(idTrans, busq, query, from);
-            processOrderBY(idTrans, builder, from, busq.getOrders(), query);
-            joinMappings.remove(idTrans);
+            processFunction(transsaction, busq, builder, query, from);
+            processWhere(transsaction, builder, from, busq.getFilters(), query);
+            processGroupBy(transsaction, busq, query, from);
+            processOrderBY(transsaction, builder, from, busq.getOrders(), query);
+            removeTranssaction(transsaction);
             List list = getList(busq, isTuple, query);
             if (Utilities.isNotEmpty(list)) {
                 return list.get(0);
@@ -1393,11 +1659,10 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
         }
     }
 
-    @Transactional(readOnly = true)
     public boolean exists(BusquedaModel busq) {
         try {
-            Long idTrans = getIdTrans();
-            EntityType o = (EntityType) cache.get(ENTITY_PREFIX + busq.getEntity());
+            Long transsaction = getIdTrans();
+            EntityType o = getEntityTypeFromCache(busq.getEntity(), transsaction);
             if (o == null) {
                 LOGGER.log(Level.INFO, "(exists) No existe objeto en cache model " + busq.getEntity() + " con parametros " + busq);
                 return false;
@@ -1410,15 +1675,15 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
             CriteriaBuilder builder = this.getEntityManager().getCriteriaBuilder();
             CriteriaQuery<Long> countQuery = builder.createQuery(Long.class);
 
-            Map<String, Object> mapClazzDonm = joinMappings.get(idTrans);
+            Map<String, Object> mapClazzDonm = joinMappings.get(transsaction);
             if (mapClazzDonm == null) {
                 mapClazzDonm = new LinkedHashMap<>();
             }
-            mapClazzDonm.put(CLASS_TRANSLATION_PREFIX + idTrans, domainClass);
-            joinMappings.put(idTrans, mapClazzDonm);
+            mapClazzDonm.put(CLASS_TRANSLATION_PREFIX + transsaction, domainClass);
+            joinMappings.put(transsaction, mapClazzDonm);
 
             Root from = countQuery.from(domainClass);
-            Predicate[] preds = processWhere(idTrans, builder, from, busq.getFilters(), countQuery);
+            Predicate[] preds = processWhere(transsaction, builder, from, busq.getFilters(), countQuery);
             if (busq.getDistinct() != null && busq.getDistinct().equals(true)) {
                 if (preds == null) {
                     countQuery.select(builder.countDistinct(from));
@@ -1432,8 +1697,18 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
                     countQuery.select(builder.count(from)).where(preds);
                 }
             }
-            Long count = this.getEntityManager().createQuery(countQuery).getSingleResult();
-            this.joinMappings.remove(idTrans);
+//            Long count = this.getEntityManager().createQuery(countQuery).getSingleResult();
+            TypedQuery<Long> countTyped = this.getEntityManager().createQuery(countQuery);
+            countTyped.setHint("org.hibernate.readOnly", Boolean.TRUE);
+            try {
+                org.hibernate.query.Query<?> hq = countTyped.unwrap(org.hibernate.query.Query.class);
+                hq.setReadOnly(true);
+                hq.setTimeout(Math.max(1, DEFAULT_QUERY_TIMEOUT_MS / 1000));
+            } catch (Exception ignore) {
+            }
+            Long count = countTyped.getSingleResult();
+
+            removeTranssaction(transsaction);
             if (count == null) {
                 count = 0L;
             }
@@ -1448,10 +1723,8 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
     public boolean deleteModelAll(GuardarModel model) {
         try {
             boolean array = false;
-            if (!cache.containsKey(ENTITY_PREFIX + model.getEntity())) {
-                this.refreshEntityModelCache();
-            }
-            EntityType o = (EntityType) cache.get(ENTITY_PREFIX + model.getEntity());
+            Long transsaction = getIdTrans();
+            EntityType o = getEntityTypeFromCache(model.getEntity(), transsaction);
             if (o == null) {
                 System.out.println("No existe objeto " + model.getEntity() + " con parametros " + model.getEntity());
                 return false;
@@ -1481,6 +1754,7 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
             }
             boolean deleteAll = deleteAll(entitiList);
             System.out.println("Respuesta guardado generico registro eliminados" + deleteAll);
+            removeTranssaction(transsaction);
             return deleteAll;
         } catch (Exception e) {
             LOGGER.log(Level.SEVERE, "--> Error el persistir entidad ", e);
@@ -1493,10 +1767,8 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
     public boolean deleteAll(Collection list) {
         try {
             for (Object entity : list) {
-                if (!cache.containsKey(ENTITY_PREFIX + entity.getClass().getSimpleName())) {
-                    this.refreshEntityModelCache();
-                }
-                EntityType o = (EntityType) cache.get(ENTITY_PREFIX + entity.getClass().getSimpleName());
+                Long transsaction = getIdTrans();
+                EntityType o = getEntityTypeFromCache(entity.getClass().getSimpleName(), transsaction);
                 if (o == null) {
                     System.out.println("No existe objeto " + entity.getClass().getSimpleName() + " con parametros " + entity.getClass().getSimpleName());
                     return false;
@@ -1508,7 +1780,15 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
                 Object idVal = f.get(entity);
                 criteriaDelete.where(this.getEntityManager().getCriteriaBuilder().equal(from.get(o.getDeclaredId(o.getIdType().getJavaType()).getName()), idVal));
                 int i = this.getEntityManager().createQuery(criteriaDelete).executeUpdate();
+                removeTranssaction(transsaction);
+                if (++i % JDBC_BATCH_SIZE == 0) {
+                    this.getEntityManager().flush();
+                    this.getEntityManager().clear();
+                }
             }
+            this.getEntityManager().flush();
+            this.getEntityManager().clear();
+
             return true;
         } catch (Exception e) {
             LOGGER.log(Level.SEVERE, "--> Error el persistir entidad ", e);
@@ -1517,4 +1797,37 @@ public class BuhoPersistableImpl<T> implements BuhoPersistable {
         return false;
     }
 
+    @Override
+    public Long count(BusquedaModel searchCriteria) {
+        String nameClazz = searchCriteria.getEntity();
+        Long count = 0L;
+        try {
+            Long idTrans = getIdTrans();
+            EntityType o = getEntityTypeFromCache(nameClazz, idTrans);
+            if (o == null) {
+                LOGGER.log(Level.INFO, "No existe objeto " + nameClazz + " con parametros " + searchCriteria);
+                return null;
+            }
+
+            Class domainClass = o.getJavaType();
+            Map<String, Object> mapClazzDonm = joinMappings.get(idTrans);
+            if (mapClazzDonm == null) {
+                mapClazzDonm = new LinkedHashMap<>();
+            }
+            mapClazzDonm.put(CLASS_TRANSLATION_PREFIX + idTrans, domainClass);
+            joinMappings.put(idTrans, mapClazzDonm);
+            if (domainClass == null) {
+                LOGGER.log(Level.INFO, "No existe objeto " + nameClazz + " con parametros " + searchCriteria);
+                return null;
+            }
+            CriteriaBuilder builder = this.getEntityManager().getCriteriaBuilder();
+            count = countData(searchCriteria, builder, domainClass, idTrans);
+
+            Utilities.logs(this, "Registros encontrados", count);
+            removeTranssaction(idTrans);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        return count;
+    }
 }
